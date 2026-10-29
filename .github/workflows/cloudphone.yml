@@ -1,0 +1,260 @@
+name: CloudPhone Japan Full Farm (Root + Uptime + Sony + SoftBank + Auto APK)
+
+on:
+  workflow_dispatch:
+    inputs:
+      so_ca_con_lai:
+        description: 'Số ca chạy liên tiếp (1 ca = 5.5h | Nhập 6 = 33h, 24 = 132h)'
+        required: true
+        default: '6'
+      danh_sach_may:
+        description: 'Danh sách các máy chạy cùng lúc (VD: [1,2,3,4,5])'
+        required: true
+        default: '[1,2,3]'
+      fake_uptime_hours:
+        description: 'Số giờ hoạt động (Uptime) muốn Fake sẵn (Giờ)'
+        required: true
+        default: '130'
+      custom_brand:
+        description: 'Hãng máy muốn Fake (sony, samsung, google)'
+        required: true
+        default: 'sony'
+      custom_model:
+        description: 'Kiểu máy cụ thể (VD: Xperia 5 IV, SO-54C, SM-G998B)'
+        required: true
+        default: 'Xperia 5 IV'
+      carrier_name:
+        description: 'Nhà mạng Nhật (SoftBank, Docomo, au, Rakuten)'
+        required: true
+        default: 'SoftBank'
+      gps_lat:
+        description: 'Vĩ độ GPS tại Nhật (Okayama: 34.6657 | Tokyo: 35.6938)'
+        required: true
+        default: '34.6657'
+      gps_lon:
+        description: 'Kinh độ GPS tại Nhật (Okayama: 133.9190 | Tokyo: 139.7034)'
+        required: true
+        default: '133.9190'
+      auto_open_pkg:
+        description: 'Package Name app muốn tự mở (VD: com.zhiliaoapp.musically.go)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  cloudphone:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        phone: ${{ fromJson(inputs.danh_sach_may) }}
+
+    steps:
+      - name: 1. Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: 2. Tải dữ liệu & Thông số máy từ ca trước
+        uses: actions/download-artifact@v4
+        with:
+          name: data-may-${{ matrix.phone }}
+          path: ./backup_data
+        continue-on-error: true
+
+      - name: 3. Cài đặt ws-scrcpy & Cloudflare Tunnel
+        run: |
+          sudo apt update && sudo apt install -y adb git nodejs npm bc
+          git clone https://github.com/NetrisTV/ws-scrcpy.git
+          cd ws-scrcpy && npm install && npm run dist
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared-linux-amd64.deb
+
+      - name: 4. Bật Root, Fake Info, Sony, SIM Nhật, GPS, Cài App & Khôi phục dữ liệu
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30 # Android 11
+          target: google_apis
+          arch: x86_64
+          profile: pixel_4
+          emulator-options: -writable-system -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          script: |
+            echo "=== 1. KÍCH HOẠT ROOT TOÀN DIỆN ==="
+            adb root
+            sleep 2
+            adb remount
+            sleep 2
+            adb shell settings put system screen_off_timeout 2147483647
+            adb shell svc power stayon true
+
+            # --- 2. CẤU HÌNH NHÀ MẠNG & SIM NHẬT BẢN ---
+            CARRIER="${{ inputs.carrier_name }}"
+            if [ "$CARRIER" = "Docomo" ]; then MCC_MNC="44010"; 
+            elif [ "$CARRIER" = "au" ]; then MCC_MNC="44051"; 
+            elif [ "$CARRIER" = "Rakuten" ]; then MCC_MNC="44011"; 
+            else MCC_MNC="44020"; CARRIER="SoftBank"; fi
+
+            echo "📶 Thiết lập SIM nhà mạng: $CARRIER (MCC/MNC: $MCC_MNC)..."
+            adb shell "setprop gsm.operator.alpha '$CARRIER'"
+            adb shell "setprop gsm.operator.iso-country 'jp'"
+            adb shell "setprop gsm.operator.numeric '$MCC_MNC'"
+            adb shell "setprop gsm.sim.operator.alpha '$CARRIER'"
+            adb shell "setprop gsm.sim.operator.numeric '$MCC_MNC'"
+            adb shell "setprop gsm.sim.operator.iso-country 'jp'"
+            adb shell "setprop gsm.sim.state 'READY'"
+            adb shell "setprop persist.sys.locale ja-JP"
+            adb shell "setprop persist.sys.timezone Asia/Tokyo"
+
+            # --- 3. TẠO HOẶC KHÔI PHỤC VÂN TAY THIẾT BỊ ---
+            mkdir -p ./backup_out
+            if [ -f "./backup_data/device_info.env" ]; then
+              echo "🔄 Nạp lại thông số phần cứng của Máy ${{ matrix.phone }} từ ca trước..."
+              source ./backup_data/device_info.env
+              cp ./backup_data/device_info.env ./backup_out/device_info.env
+            else
+              echo "🆕 Khởi tạo bộ thông số phần cứng độc lập cho Máy ${{ matrix.phone }}..."
+              ANDROID_ID=$(cat /dev/urandom | tr -dc 'a-f0-9' | fold -w 16 | head -n 1)
+              SERIAL_NO="CB5A$(cat /dev/urandom | tr -dc 'A-Z0-9' | fold -w 7 | head -n 1)"
+              IMEI_NO="35$(cat /dev/urandom | tr -dc '0-9' | fold -w 13 | head -n 1)"
+              MAC_ADDR=$(printf '02:%02x:%02x:%02x:%02x:%02x' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))
+              NOW_SEC=$(date +%s)
+              FAKE_SEC=$(( NOW_SEC - (${{ inputs.fake_uptime_hours }} * 3600) ))
+              FIRST_BOOT_MS="${FAKE_SEC}000"
+
+              cat <<EOF > ./backup_out/device_info.env
+              ANDROID_ID=$ANDROID_ID
+              SERIAL_NO=$SERIAL_NO
+              IMEI_NO=$IMEI_NO
+              MAC_ADDR=$MAC_ADDR
+              FIRST_BOOT_MS=$FIRST_BOOT_MS
+            EOF
+            fi
+
+            echo "=== 4. FAKE UPTIME (${{ inputs.fake_uptime_hours }}H) & MODEL THIẾT BỊ ==="
+            PAST_DATE=$(date -d "-${{ inputs.fake_uptime_hours }} hours" +"%m%d%H%M%Y.%S")
+            adb shell "settings put global auto_time 0"
+            adb shell "date $PAST_DATE"
+
+            adb shell "setprop ro.runtime.firstboot $FIRST_BOOT_MS"
+            adb shell "settings put secure android_id $ANDROID_ID"
+            
+            MODEL_NAME="${{ inputs.custom_model }}"
+            BRAND_NAME="${{ inputs.custom_brand }}"
+            
+            adb shell "sed -i 's/ro.product.model=.*/ro.product.model=$MODEL_NAME/' /system/build.prop"
+            adb shell "sed -i 's/ro.product.brand=.*/ro.product.brand=$BRAND_NAME/' /system/build.prop"
+            adb shell "sed -i 's/ro.product.manufacturer=.*/ro.product.manufacturer=$BRAND_NAME/' /system/build.prop"
+            adb shell "sed -i 's/ro.product.device=.*/ro.product.device=$MODEL_NAME/' /system/build.prop"
+            adb shell "echo 'ro.serialno=$SERIAL_NO' >> /system/build.prop"
+
+            # --- 5. TỰ ĐỘNG CÀI ĐẶT APP SẴN CÓ TỪ THƯ MỤC `apks/` & KHÔI PHỤC DỮ LIỆU ---
+            echo "📦 Đang cài đặt sẵn các ứng dụng..."
+            if [ -d "./apks" ]; then
+              for apk in ./apks/*.apk; do
+                if [ -f "$apk" ]; then
+                  echo "Cài đặt: $apk"
+                  adb install -r "$apk" || true
+                fi
+              done
+            fi
+
+            if [ -f "./backup_data/state.tar.gz" ]; then
+              echo "🔄 Khôi phục APK và dữ liệu tài khoản từ ca trước..."
+              for apk in ./backup_data/apks/*.apk; do
+                if [ -f "$apk" ]; then adb install -r "$apk" || true; fi
+              done
+              adb push ./backup_data/state.tar.gz /sdcard/state.tar.gz
+              adb shell "tar -xzf /sdcard/state.tar.gz -C /"
+              adb shell "rm /sdcard/state.tar.gz"
+              
+              for pkg in $(adb shell pm list packages -3 | cut -f 2 -d ":" | tr -d '\r'); do
+                APP_UID=$(adb shell stat -c '%u' /data/data/$pkg 2>/dev/null | tr -d '\r')
+                if [ ! -z "$APP_UID" ]; then adb shell "chown -R $APP_UID:$APP_UID /data/data/$pkg" || true; fi
+              done
+            fi
+
+            NOW_DATE=$(date +"%m%d%H%M%Y.%S")
+            adb shell "date $NOW_DATE"
+            adb shell "settings put global auto_time 1"
+
+            # --- 6. GIẢ LẬP GPS TẠI NHẬT BẢN ---
+            LAT="${{ inputs.gps_lat }}"
+            LON="${{ inputs.gps_lon }}"
+            echo "📍 Đặt tọa độ GPS ảo tại Nhật (Lat: $LAT, Lon: $LON)..."
+            adb shell "settings put secure mock_location 1"
+            adb emu geo fix $LON $LAT
+
+            # Tự động mở App nếu có cấu hình
+            if [ ! -z "${{ inputs.auto_open_pkg }}" ]; then
+              echo "🚀 Tự động mở ứng dụng: ${{ inputs.auto_open_pkg }}"
+              adb shell monkey -p ${{ inputs.auto_open_pkg }} -c android.intent.category.LAUNCHER 1 || true
+            fi
+
+            # --- 7. MỞ WEB ĐIỀU KHIỂN QUA CLOUDFLARE ---
+            nohup node ws-scrcpy/dist/index.js > ws.log 2>&1 &
+            sleep 3
+            nohup cloudflared tunnel --url http://localhost:8000 > cf.log 2>&1 &
+            sleep 8
+            LINK=$(grep -o 'https://[-a-zA-Z0-9.]*\.trycloudflare\.com' cf.log | head -n 1)
+
+            echo "=================================================================="
+            echo "📱 MÁY SỐ ${{ matrix.phone }} | HÃNG: $BRAND_NAME | MODEL: $MODEL_NAME"
+            echo "📶 NHÀ MẠNG: $CARRIER (Nhật) | 📍 GPS: $LAT, $LON"
+            echo "⏱️ UPTIME GIẢ LẬP: ${{ inputs.fake_uptime_hours }}+ TIẾNG"
+            echo "👉 LINK ĐIỀU KHIỂN WEB: $LINK"
+            echo "=================================================================="
+
+            # --- 8. NGÂM MÁY TRONG 5 TIẾNG 15 PHÚT ---
+            for i in {1..63}; do
+              TOTAL_HOURS=$(echo "scale=1; ${{ inputs.fake_uptime_hours }} + ($i * 5 / 60)" | bc)
+              echo "⏳ [Máy ${{ matrix.phone }}] Chu kỳ $i/63 | Uptime hệ thống: ${TOTAL_HOURS}h | Link: $LINK"
+              adb shell input keyevent KEYCODE_WAKEUP
+              sleep 300
+            done
+
+            # --- 9. SAO LƯU TRƯỚC KHI CHUYỂN CA ---
+            echo "💾 Đang sao lưu APK và dữ liệu /data/data..."
+            mkdir -p ./backup_out/apks
+            for pkg in $(adb shell pm list packages -3 | cut -f 2 -d ":" | tr -d '\r'); do
+              APK_PATH=$(adb shell pm path "$pkg" | head -n 1 | cut -f 2 -d ":" | tr -d '\r')
+              adb pull "$APK_PATH" "./backup_out/apks/${pkg}.apk" || true
+              adb shell am force-stop "$pkg" || true
+            done
+            adb shell "tar -czf /sdcard/state.tar.gz /data/data /sdcard/Android" || true
+            adb pull /sdcard/state.tar.gz ./backup_out/state.tar.gz
+
+      - name: 5. Đẩy bản sao lưu lên GitHub Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-may-${{ matrix.phone }}
+          path: ./backup_out/*
+          retention-days: 5
+          overwrite: true
+
+  chuyen-ca-tiep-theo:
+    needs: cloudphone
+    runs-on: ubuntu-latest
+    if: always() && (inputs.so_ca_con_lai > 1)
+    steps:
+      - name: Tự động chuyển ca & Tăng Uptime
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NEXT_CA=$(( ${{ inputs.so_ca_con_lai }} - 1 ))
+          NEXT_UPTIME=$(( ${{ inputs.fake_uptime_hours }} + 5 ))
+          echo "🔄 Chuyển sang ca mới! Số ca còn lại: $NEXT_CA | Uptime mới: ${NEXT_UPTIME}h"
+          
+          gh workflow run cloudphone.yml \
+            --repo ${{ github.repository }} \
+            -f so_ca_con_lai="$NEXT_CA" \
+            -f danh_sach_may='${{ inputs.danh_sach_may }}' \
+            -f fake_uptime_hours="$NEXT_UPTIME" \
+            -f custom_brand="${{ inputs.custom_brand }}" \
+            -f custom_model="${{ inputs.custom_model }}" \
+            -f carrier_name="${{ inputs.carrier_name }}" \
+            -f gps_lat="${{ inputs.gps_lat }}" \
+            -f gps_lon="${{ inputs.gps_lon }}" \
+            -f auto_open_pkg="${{ inputs.auto_open_pkg }}"
